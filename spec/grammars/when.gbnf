@@ -1,0 +1,5 @@
+# Due day and time for a task whose wording the date rules could not parse.
+# The reply is pre-filled with {"day": " .
+root ::= day "\", \"time\": \"" time "\"}"
+day  ::= "none" | "today" | "tomorrow" | "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday"
+time ::= "none" | [0-2] [0-9] ":" [0-5] [0-9]

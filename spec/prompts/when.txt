@@ -1,0 +1,5 @@
+Now is {{NOW}}.
+When is this task due? Give the day and a 24-hour time. Use "none" if the task says nothing about when.
+Typical times: morning 09:00, afternoon 14:00, after work or evening 18:00, tonight 20:00.
+
+Task: {{TASK}}

@@ -1,0 +1,5 @@
+Turn the request into a short lookup for a public information service.
+Never include names of people, private details or the original sentence.
+For weather, choose how many hours ahead to forecast.
+
+Request: {{QUESTION}}

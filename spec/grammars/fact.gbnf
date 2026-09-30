@@ -1,0 +1,8 @@
+# A typed fact request (sheet 4). The reply is pre-filled with the fixed part, e.g.
+# {"kind": "weather", "hours": , so the model only fills the value. Location is
+# added by code, never by the model. {{KIND}} selects the rule.
+root    ::= {{KIND}}
+weather ::= ("6" | "12" | "24" | "48") "}"
+search  ::= qchar{3,80} "\"}"
+qchar   ::= [a-zA-Z0-9 ,.'-]
+news    ::= ("local" | "tech" | "business" | "sport") "\"}"

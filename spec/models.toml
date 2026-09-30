@@ -1,0 +1,95 @@
+# Shared with the Android build. Every model Kin loads is listed here with a
+# pinned sha256; `kin fetch-models` downloads and verifies, the running app
+# never downloads anything.
+
+[vad]
+engine = "onnxruntime"
+name = "Silero VAD v5"
+url = "https://github.com/snakers4/silero-vad/raw/v5.1.2/src/silero_vad/data/silero_vad.onnx"
+dir = "vad"
+files = { "silero_vad.onnx" = "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f" }
+
+[wake_word]
+engine = "openwakeword"
+# Stand-in until the custom "Hey Kin" model is trained; swap `keyword` and the
+# file below when it exists.
+name = "openWakeWord hey_jarvis v0.1 (stand-in for Hey Kin)"
+keyword = "hey_jarvis_v0.1.onnx"
+phrase = "hey jarvis"  # stripped from the start of command transcripts
+url_base = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/"
+dir = "wake_word"
+files = { "melspectrogram.onnx" = "ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f", "embedding_model.onnx" = "70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f", "hey_jarvis_v0.1.onnx" = "94a13cfe60075b132f6a472e7e462e8123ee70861bc3fb58434a73712ee0d2cb" }
+
+[asr]
+# Which speech-to-text model each profile uses. Override with `--asr NAME` or KIN_ASR.
+# Measured on this laptop (tests/data/asr_eval, 12 sentences with Indian names, clean + noisy):
+#   moonshine-tiny  WER 21.5% / 25.9%, names 22/68, RTF 0.033, ~180 MB
+#   moonshine-base  WER 14.1% / 15.5%, names 35/68, RTF 0.045, ~250 MB   <- phone default
+#   parakeet-0.6b   WER 11.1% / 12.2%, names 41/68, RTF 0.116, ~800 MB   <- laptop default
+#   whisper-small   WER 11.1% / 11.2%, names 43/68, RTF 0.55,  ~800 MB   (slow; strong on accents)
+phone = "moonshine-base"
+laptop = "parakeet-0.6b"
+
+[asr_models.moonshine-tiny]
+kind = "moonshine"
+name = "Moonshine Tiny int8 (week 1)"
+url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-int8.tar.bz2"
+dir = "asr/sherpa-onnx-moonshine-tiny-en-int8"
+extract_to = "asr"
+files = { "preprocess.onnx" = "f33addce61a143460fe753b5ee5b7db255e5140b5b779c065b94f6c83ff0bf4e", "encode.int8.onnx" = "8774dfba578de027ec6595c2c654a0836434489bc963a0db124a7f181f571acb", "uncached_decode.int8.onnx" = "216737000dd5881a17aa043f6bbd286add33e4c3b0ae257153e2ec15438bdc41", "cached_decode.int8.onnx" = "2aff28bba6a03d8dcf5c9feac45462629bae37317442299f28115ad09da773f6", "tokens.txt" = "1165c2aeb9f72f457a83be2d459a09054f27490acd9b41bd43794dfd25e296ea" }
+
+[asr_models.moonshine-base]
+kind = "moonshine_v2"
+name = "Moonshine v2 Base (quantized, 2026-02)"
+url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-quantized-2026-02-27.tar.bz2"
+dir = "asr/sherpa-onnx-moonshine-base-en-quantized-2026-02-27"
+extract_to = "asr"
+encoder = "encoder_model.ort"
+decoder = "decoder_model_merged.ort"
+files = { "encoder_model.ort" = "7c66495948d0d08ec1af454cd4b5514862ae6511e94712a60e6d83eaec8dc8cf", "decoder_model_merged.ort" = "d9d7b333af34bc552580576ddcf248a1c6c839e0d3b43b09afb9376ed009899d", "tokens.txt" = "2870d843e14c1e187bf1913a521562a63b53933814bd7f2145120468f494a049" }
+
+[asr_models."parakeet-0.6b"]
+kind = "nemo_transducer"
+name = "NVIDIA Parakeet 0.6B int8 (non-streaming)"
+url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2"
+dir = "asr/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"
+extract_to = "asr"
+encoder = "encoder.int8.onnx"
+decoder = "decoder.int8.onnx"
+joiner = "joiner.int8.onnx"
+files = { "encoder.int8.onnx" = "6716910b7a0833997fec7a410494c995d70124001a0e9b66d6370d6aced577e0", "decoder.int8.onnx" = "a5e223392c90e75f8144cdb5eb95af7625db389e39edef2bd1a9c872b3298fe6", "joiner.int8.onnx" = "869f43f7d24595c55581ad3bf249a935fb8a71389fbdaa7504b9f46f93140f8a", "tokens.txt" = "dc0b4584ab2e4ddbf888425c076c61b736e7356a015250db7d307e6f1a8188ff" }
+
+[asr_models.whisper-small]
+kind = "whisper"
+name = "Whisper small.en int8"
+url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.en.tar.bz2"
+dir = "asr/sherpa-onnx-whisper-small.en"
+extract_to = "asr"
+encoder = "small.en-encoder.int8.onnx"
+decoder = "small.en-decoder.int8.onnx"
+tokens = "small.en-tokens.txt"
+prune = true  # the archive also holds 600 MB of float32 weights Kin never loads
+files = { "small.en-encoder.int8.onnx" = "8bdac288f369aa94ee2194059238c465ed82ea9d47ee8fa4a8c0a891873e462f", "small.en-decoder.int8.onnx" = "710ccf890e10f3faa15f51ec346081a2723c9f3adb6e4da81c6573a5a6f877fb", "small.en-tokens.txt" = "306cd27f03c1a714eca7108e03d66b7dc042abe8c258b44c199a7ed9838dd930" }
+
+[embed]
+engine = "onnxruntime + tokenizers"
+# The ARM int8 build is the file the Android app loads; it also runs on x86.
+name = "all-MiniLM-L6-v2 int8 (384-d)"
+dim = 384
+max_tokens = 256
+dir = "embed"
+urls = { "model_qint8_arm64.onnx" = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/onnx/model_qint8_arm64.onnx", "tokenizer.json" = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json" }
+files = { "model_qint8_arm64.onnx" = "4278337fd0ff3c68bfb6291042cad8ab363e1d9fbc43dcb499fe91c871902474", "tokenizer.json" = "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037" }
+
+[llm]
+engine = "llama.cpp"
+# Google's quantization-aware-trained Q4_0 build: best quality at 4 bits.
+name = "Gemma 3 1B instruct QAT Q4_0 (GGUF)"
+url = "https://huggingface.co/bartowski/google_gemma-3-1b-it-qat-GGUF/resolve/074329a7942d6a61a3748a80ed1bbc9e2d7d0e18/google_gemma-3-1b-it-qat-Q4_0.gguf"
+dir = "llm"
+file = "google_gemma-3-1b-it-qat-Q4_0.gguf"
+files = { "google_gemma-3-1b-it-qat-Q4_0.gguf" = "6364f1139062ff56ee03faf69c8feba6633f740305f8f8b0fe922b25de9438e3" }
+template = "gemma"
+n_ctx = 2048
+idle_unload_s = 60
+max_answer_tokens = 64

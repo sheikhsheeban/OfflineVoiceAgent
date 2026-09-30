@@ -1,0 +1,4 @@
+# Intent choice for close calls. The reply is pre-filled with {"intent": " so the
+# model only produces the name. {{INTENTS}} is replaced with the quoted intent names.
+root   ::= intent "\"}"
+intent ::= {{INTENTS}}

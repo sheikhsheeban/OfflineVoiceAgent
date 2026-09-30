@@ -1,0 +1,120 @@
+# Router examples, shared with Android. Each intent's centroid is the mean of its
+# example embeddings; a question close to one centroid (and clearly closer than to
+# the runner-up) is routed without the language model. Close calls go to the
+# model, constrained by grammars/route.gbnf.
+
+[router]
+min_similarity = 0.40   # tasks and reminders need at least this (or a rule)
+min_margin = 0.06       # top-1 minus top-2 below this is a close call: let the model decide
+
+[intents."recall.query"]
+description = "a question about something the user heard, said, planned or was told, including their own personal details"
+examples = [
+  "What did Priya say about the budget?",
+  "When is the site visit?",
+  "What did Rohan tell me yesterday?",
+  "Did anyone mention the invoice?",
+  "Where is the meeting on Friday?",
+  "What was the name of the contractor?",
+  "What time did Meera say the flight lands?",
+  "Who was supposed to send the slides?",
+  "What did we decide about the office move?",
+  "What did my sister say about Sunday?",
+  "Which day did Anjali say she is free?",
+  "What was the address Suresh gave me?",
+]
+
+[intents."task.add"]
+description = "the user explicitly asks to add something to their to-do list"
+examples = [
+  "Remind me to call the landlord after work",
+  "Add a task to pay the electricity bill",
+  "Put buy groceries on my list",
+  "Add call Suresh to my tasks",
+  "Make a note to book the cab",
+  "Don't let me forget to email Kiran",
+  "I need to renew my passport, add it to my list",
+  "Add pick up the dry cleaning tomorrow",
+  "Note down that I have to fix the kitchen sink",
+]
+
+[intents."task.list"]
+description = "list the user's open tasks"
+examples = [
+  "What's on my list?",
+  "What are my tasks?",
+  "What do I have to do?",
+  "Show my to-do list",
+  "Any pending tasks?",
+  "What's left on my to-do list?",
+  "Read me my tasks",
+]
+
+[intents."reminder.set"]
+description = "remind the user at a specific time or after a delay"
+examples = [
+  "In 20 minutes, tell me to leave",
+  "Remind me at 5 pm to call mom",
+  "Set a reminder for 10 minutes",
+  "Tell me in an hour to check the oven",
+  "At 6, remind me to take my medicine",
+  "Ping me in half an hour",
+  "Wake me up in 15 minutes",
+]
+
+[intents."digest.today"]
+description = "a summary of today's commitments and conversations"
+examples = [
+  "What did I commit to today?",
+  "Summarize my day",
+  "What happened today?",
+  "What did I promise today?",
+  "Give me today's summary",
+  "What did I agree to do today?",
+]
+
+[intents."fact.weather"]
+description = "the weather or forecast"
+examples = [
+  "Will it rain tomorrow?",
+  "What's the weather like?",
+  "Should I take an umbrella?",
+  "Is it going to be hot this afternoon?",
+  "What's the temperature outside?",
+  "Do I need a jacket this evening?",
+]
+
+[intents."fact.search"]
+description = "look something up on the internet"
+examples = [
+  "Is the Wardha road closed?",
+  "Look up the opening hours of the post office",
+  "Search for train timings to Pune",
+  "What's the price of petrol today?",
+  "When does the passport office open?",
+  "How far is Nagpur from Pune?",
+]
+
+[intents."fact.news"]
+description = "news headlines"
+examples = [
+  "What's in the news?",
+  "Any tech news today?",
+  "Latest business headlines",
+  "What's happening in Nagpur today?",
+  "Sports news please",
+  "Tell me the local news",
+]
+
+[intents."unsupported"]
+description = "asks Kin itself to write, draft, create, book, buy, send, call, play or control something"
+examples = [
+  "Draft my tax return",
+  "Write a poem about the sea",
+  "Book a flight to Delhi",
+  "Send an email to my boss",
+  "Order a pizza",
+  "Translate this into French",
+  "Play some music",
+  "Call my mother",
+]
