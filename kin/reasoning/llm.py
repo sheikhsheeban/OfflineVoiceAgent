@@ -116,6 +116,18 @@ class LocalLLM:
                 self._llm = None
                 log.info("language model released")
 
+    def unload_if_idle(self) -> bool:
+        """Release the model unless it is answering right now. Never blocks."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if self._llm is None:
+                return False
+            self.unload()
+            return True
+        finally:
+            self._lock.release()
+
     def maybe_unload(self, now: float | None = None) -> bool:
         """Release the model after `idle_unload_s` without use. Returns True if it did."""
         now = time.monotonic() if now is None else now

@@ -11,6 +11,7 @@ secure-delete mode, and a full wipe also destroys the key.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -80,6 +81,8 @@ class Store:
         self.conn.execute("PRAGMA secure_delete = ON")
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript((SPEC_DIR / "schema.sql").read_text(encoding="utf-8"))
+        if "notified_at" not in {r[1] for r in self._q("PRAGMA table_info(tasks)")}:  # older database
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN notified_at REAL")
         self.conn.execute("INSERT INTO utterances_fts(utterances_fts, rank) VALUES ('secure-delete', 1)")
         self.conn.execute(
             "INSERT OR IGNORE INTO meta VALUES ('schema_version', ?), ('created_at', ?)",
@@ -391,9 +394,27 @@ class Store:
 
     # -- deletion -------------------------------------------------------------------
 
-    def _delete_vector(self, ep_id: int) -> None:
+    def _delete_vector(self, ep_id: int, expired: bool = False) -> None:
         table = "episode_vec" if self.vec_backend == "sqlite-vec" else "episode_vec_blob"
         self.conn.execute(f"DELETE FROM {table} WHERE episode_id = ?", (ep_id,))
+        self._delete_derived(ep_id, expired)
+
+    def _delete_derived(self, ep_id: int, expired: bool) -> None:
+        """People, facts and the day's digest come from an episode's text, so they go when
+        that text changes or is deleted. When the text merely *expires* (7 days), facts and
+        people stay (their own one-year life) and only lose the link to it."""
+        if expired:
+            self.conn.execute("UPDATE person_mentions SET episode_id = NULL WHERE episode_id = ?", (ep_id,))
+            self.conn.execute("UPDATE fact_sources SET episode_id = NULL WHERE episode_id = ?", (ep_id,))
+            return
+        row = self._q("SELECT started_at FROM episodes WHERE id = ?", (ep_id,))
+        if row:
+            day = time.strftime("%Y-%m-%d", time.localtime(row[0][0]))
+            self.conn.execute("DELETE FROM digests WHERE day = ?", (day,))
+        self.conn.execute("DELETE FROM person_mentions WHERE episode_id = ?", (ep_id,))
+        self.conn.execute("DELETE FROM people WHERE id NOT IN (SELECT person_id FROM person_mentions)")
+        self.conn.execute("DELETE FROM fact_sources WHERE episode_id = ?", (ep_id,))
+        self.conn.execute("DELETE FROM facts WHERE id NOT IN (SELECT fact_id FROM fact_sources)")
 
     def _detach_tasks(self, where: str, args: tuple) -> None:
         """Speech is being deleted: drop commitments Kin merely heard from it, and
@@ -401,10 +422,10 @@ class Store:
         self.conn.execute(f"DELETE FROM tasks WHERE status IN ('candidate', 'dismissed') AND ({where})", args)
         self.conn.execute(f"UPDATE tasks SET quote = NULL, episode_id = NULL, utterance_id = NULL WHERE {where}", args)
 
-    def _delete_episode_rows(self, ep_id: int) -> None:
+    def _delete_episode_rows(self, ep_id: int, expired: bool = False) -> None:
         self._detach_tasks("episode_id = ?", (ep_id,))
         self.conn.execute("DELETE FROM utterances WHERE episode_id = ?", (ep_id,))  # fires the FTS delete trigger
-        self._delete_vector(ep_id)
+        self._delete_vector(ep_id, expired)
         self.conn.execute("DELETE FROM episodes WHERE id = ?", (ep_id,))
 
     def delete_episode(self, ep_id: int) -> bool:
@@ -437,6 +458,7 @@ class Store:
                         reembed.append(ep_id)
                 else:
                     removed += 1
+            self.conn.execute("DELETE FROM turns WHERE ts >= ?", (t,))
             self.conn.execute("COMMIT")
         return {"utterances": n_utt, "episodes_removed": removed, "reembed": reembed}
 
@@ -447,8 +469,9 @@ class Store:
             if ids:
                 self.conn.execute("BEGIN IMMEDIATE")
                 for ep_id in ids:
-                    self._delete_episode_rows(ep_id)
+                    self._delete_episode_rows(ep_id, expired=True)
                 self.conn.execute("COMMIT")
+            self.conn.execute("DELETE FROM turns WHERE ts < ?", (t,))
             return len(ids)
 
     def wipe(self) -> None:
@@ -557,9 +580,158 @@ class Store:
             )
             return n.rowcount == 1
 
+    def take_due_tasks(self, now: float, max_age_s: float = 86400.0) -> list[dict]:
+        """Open tasks whose due time has come and that Kin has not yet mentioned; marks them mentioned."""
+        with self._lock:
+            rows = self._task_rows(
+                "status = 'open' AND due_at IS NOT NULL AND due_at <= ? AND due_at >= ? AND notified_at IS NULL",
+                (now, now - max_age_s),
+            )
+            for r in rows:
+                self.conn.execute("UPDATE tasks SET notified_at = ? WHERE id = ?", (now, r["id"]))
+            return rows
+
     def episodes_between(self, t0: float, t1: float) -> int:
         with self._lock:
             return self._q("SELECT count(*) FROM episodes WHERE started_at >= ? AND started_at < ?", (t0, t1))[0][0]
+
+    # -- conversation turns (section 11) -----------------------------------------------
+
+    def add_turn(self, question: str, intent: str, answer: str, citations: list | None = None, ts=None) -> int:
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO turns (ts, question, intent, answer, citations) VALUES (?, ?, ?, ?, ?)",
+                (ts if ts is not None else time.time(), question, intent, answer, json.dumps(citations or [])),
+            )
+            return cur.lastrowid
+
+    def turns(self, limit: int = 4, since: float | None = None) -> list[dict]:
+        """Newest last."""
+        with self._lock:
+            rows = self._q(
+                "SELECT id, ts, question, intent, answer, citations FROM turns WHERE ts >= ? "
+                "ORDER BY id DESC LIMIT ?",
+                (since or 0.0, limit),
+            )
+        return [
+            {"id": r[0], "ts": r[1], "question": r[2], "intent": r[3], "answer": r[4], "citations": json.loads(r[5])}
+            for r in reversed(rows)
+        ]
+
+    # -- people and facts (P5), digests (M3) ------------------------------------------
+
+    def add_people(self, names: list[str], ep_id: int, now: float) -> None:
+        with self._lock:
+            for name in names:
+                self.conn.execute(
+                    "INSERT INTO people (name, first_seen, last_seen) VALUES (?, ?, ?) "
+                    "ON CONFLICT(name) DO UPDATE SET last_seen = excluded.last_seen",
+                    (name, now, now),
+                )
+                pid = self._q("SELECT id FROM people WHERE name = ?", (name,))[0][0]
+                if not self._q("SELECT 1 FROM person_mentions WHERE person_id = ? AND episode_id = ?", (pid, ep_id)):
+                    self.conn.execute("INSERT INTO person_mentions VALUES (?, ?)", (pid, ep_id))
+
+    def people(self) -> list[dict]:
+        with self._lock:
+            rows = self._q(
+                "SELECT p.name, p.aliases, p.first_seen, p.last_seen, "
+                "(SELECT count(*) FROM person_mentions m WHERE m.person_id = p.id) FROM people p ORDER BY p.name"
+            )
+        return [{"name": r[0], "aliases": [a for a in r[1].split(",") if a], "first_seen": r[2],
+                 "last_seen": r[3], "mentions": r[4]} for r in rows]  # fmt: skip
+
+    def add_fact(self, subject: str, claim: str, ep_id: int, now: float) -> int:
+        with self._lock:
+            cur = self.conn.execute(
+                "INSERT INTO facts (subject, claim, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (subject, claim, now, now),
+            )
+            self.conn.execute("INSERT INTO fact_sources VALUES (?, ?)", (cur.lastrowid, ep_id))
+            return cur.lastrowid
+
+    def facts(self) -> list[dict]:
+        with self._lock:
+            rows = self._q("SELECT id, subject, claim, created_at, updated_at FROM facts ORDER BY id")
+            out = []
+            for fid, subject, claim, c, u in rows:
+                src = [r[0] for r in self._q("SELECT episode_id FROM fact_sources WHERE fact_id = ?", (fid,))]
+                out.append({"id": fid, "subject": subject, "claim": claim, "created_at": c, "updated_at": u,
+                            "sources": [x for x in src if x is not None]})  # fmt: skip
+            return out
+
+    def merge_duplicate_facts(self) -> int:
+        """Facts with the same subject and claim (ignoring case and punctuation) become one, keeping every source."""
+        with self._lock:
+            seen: dict[tuple[str, str], int] = {}
+            merged = 0
+            self.conn.execute("BEGIN IMMEDIATE")
+            for fid, subject, claim in self._q("SELECT id, subject, claim FROM facts ORDER BY id"):
+                key = (subject.lower(), " ".join(re.findall(r"[a-z0-9]+", claim.lower())))
+                keep = seen.setdefault(key, fid)
+                if keep != fid:
+                    self.conn.execute("UPDATE fact_sources SET fact_id = ? WHERE fact_id = ?", (keep, fid))
+                    self.conn.execute("DELETE FROM facts WHERE id = ?", (fid,))
+                    self.conn.execute("UPDATE facts SET updated_at = ? WHERE id = ?", (time.time(), keep))
+                    merged += 1
+            self.conn.execute("COMMIT")
+            return merged
+
+    def expire_derived(self, older_than: float) -> dict:
+        """Facts, people and digests live a year (sheet 6)."""
+        with self._lock:
+            f = self.conn.execute("DELETE FROM facts WHERE updated_at < ?", (older_than,)).rowcount
+            d = self.conn.execute("DELETE FROM digests WHERE created_at < ?", (older_than,)).rowcount
+            p = self.conn.execute(
+                "DELETE FROM people WHERE last_seen < ? AND id NOT IN "
+                "(SELECT person_id FROM person_mentions WHERE episode_id IS NOT NULL)",
+                (older_than,),
+            ).rowcount
+            self.conn.execute("DELETE FROM egress_log WHERE ts < ?", (older_than,))
+            return {"facts": f, "digests": d, "people": p}
+
+    def set_digest(self, day: str, text: str, n_episodes: int, now: float | None = None) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO digests VALUES (?, ?, ?, ?)", (day, text, n_episodes, now or time.time())
+            )
+
+    def get_digest(self, day: str) -> dict | None:
+        with self._lock:
+            r = self._q("SELECT day, text, n_episodes, created_at FROM digests WHERE day = ?", (day,))
+        return {"day": r[0][0], "text": r[0][1], "n_episodes": r[0][2], "created_at": r[0][3]} if r else None
+
+    def episodes_on(self, t0: float, t1: float) -> list[dict]:
+        """Closed episodes that started in [t0, t1), oldest first, with their text."""
+        with self._lock:
+            rows = self._q(
+                "SELECT id, started_at, text FROM episodes WHERE started_at >= ? AND started_at < ? "
+                "ORDER BY started_at",
+                (t0, t1),
+            )
+        return [{"id": r[0], "started_at": r[1], "text": r[2]} for r in rows]
+
+    # -- egress ledger (CL3) ---------------------------------------------------------------
+
+    def add_egress(self, e: dict) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO egress_log (ts, host, payload, bytes_out, bytes_in, status) VALUES (?, ?, ?, ?, ?, ?)",
+                (e["ts"], e["host"], e["payload"], e["bytes_out"], e["bytes_in"], e["status"]),
+            )
+
+    def egress(self, limit: int = 100) -> list[dict]:
+        with self._lock:
+            rows = self._q(
+                "SELECT id, ts, host, payload, bytes_out, bytes_in, status FROM egress_log ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+        return [dict(zip(("id", "ts", "host", "payload", "bytes_out", "bytes_in", "status"), r, strict=True))
+                for r in rows]  # fmt: skip
+
+    def egress_count(self) -> int:
+        with self._lock:
+            return self._q("SELECT count(*) FROM egress_log")[0][0]
 
     # -- info -----------------------------------------------------------------------
 

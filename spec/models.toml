@@ -93,3 +93,20 @@ template = "gemma"
 n_ctx = 2048
 idle_unload_s = 60
 max_answer_tokens = 64
+
+[voice]
+engine = "piper"
+# Piper runs on ONNX Runtime on the laptop and on a Raspberry Pi 4.
+name = "Piper en_US lessac low (16 kHz)"
+dir = "voice"
+file = "en_US-lessac-low.onnx"
+urls = { "en_US-lessac-low.onnx" = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/low/en_US-lessac-low.onnx", "en_US-lessac-low.onnx.json" = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/low/en_US-lessac-low.onnx.json" }
+files = { "en_US-lessac-low.onnx" = "f7d01dde371555732c4c314111ac79672b1a5ce2fc19266ab42178fd8df7f375", "en_US-lessac-low.onnx.json" = "45754dfdebb3b8661c3fc564713772deec6e064feeb5b4e9594857dc7305193a" }
+
+[speaker]
+engine = "sherpa-onnx"
+name = "WeSpeaker ResNet34 (VoxCeleb, 256-d)"
+dir = "speaker"
+file = "wespeaker_en_voxceleb_resnet34.onnx"
+url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34.onnx"
+files = { "wespeaker_en_voxceleb_resnet34.onnx" = "5ef208a9da1453335308a6b6f4e6dfbd7e183a38b604de0a57664f45d257fe94" }

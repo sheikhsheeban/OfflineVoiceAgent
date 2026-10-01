@@ -1,0 +1,44 @@
+[importlinter]
+root_package = kin
+include_external_packages = True
+
+# INV4: only kin.gateway makes network requests; kin.fetch is the separate model downloader
+# (`kin fetch-models`), which the running app never calls.
+[importlinter:contract:only-gateway-goes-online]
+name = Only kin.gateway may use HTTP libraries
+type = forbidden
+source_modules =
+    kin
+forbidden_modules =
+    httpx
+    requests
+    urllib
+    urllib3
+    http
+    aiohttp
+ignore_imports =
+    kin.gateway.** -> httpx
+    kin.gateway.** -> urllib
+    kin.fetch -> urllib
+
+# The no-network processes never open sockets or serve HTTP themselves.
+[importlinter:contract:no-network-in-audio-and-core]
+name = kin-audio and kin-core code never imports a socket or web-server library
+type = forbidden
+source_modules =
+    kin.audio
+    kin.core
+    kin.perception
+    kin.memory
+    kin.reasoning
+    kin.output
+    kin.context
+forbidden_modules =
+    socket
+    ssl
+    websockets
+    uvicorn
+    fastapi
+    starlette
+ignore_imports =
+    kin.guard -> socket

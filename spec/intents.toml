@@ -118,3 +118,28 @@ examples = [
   "Play some music",
   "Call my mother",
 ]
+
+[intents."general.knowledge"]
+description = "asks for general knowledge that does not depend on the user's own life or on current events"
+examples = [
+  "What is Python?",
+  "What does DNS stand for?",
+  "Who wrote Hamlet?",
+  "How many legs does a spider have?",
+  "What is the capital of France?",
+  "Explain photosynthesis simply",
+  "What is machine learning?",
+  "How does a refrigerator work?",
+  "What is the speed of light?",
+  "Define inflation",
+]
+
+[intents."meta.history"]
+description = "asks about the conversation with Kin itself: the last question, or to repeat the last answer"
+examples = [
+  "What was my last question?",
+  "What did I just ask you?",
+  "Repeat that",
+  "Say that again",
+  "What did you just say?",
+]

@@ -48,7 +48,8 @@ def test_replay_ambient_has_no_command():
 def test_resources_are_measured_and_within_budget():
     sup = replay(DATA / "command.wav", speed=1.0)
     assert len(sup.stats_history) >= 3
-    assert set(sup.stats_history[-1]["procs"]) == {"kin-audio", "kin-core"}
+    assert set(sup.stats_history[-1]["procs"]) == {"kin-audio", "kin-core", "kin-gateway"}
+    assert max(s["procs"]["kin-gateway"]["rss_mb"] for s in sup.stats_history) < 100  # sheet 3: about 45 MB
     # Sheet 3 budgets, with headroom for Windows working-set accounting.
     assert max(s["procs"]["kin-audio"]["rss_mb"] for s in sup.stats_history) < 120
     assert max(s["procs"]["kin-core"]["rss_mb"] for s in sup.stats_history) < 1100

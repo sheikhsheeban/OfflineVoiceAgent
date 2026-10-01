@@ -1,7 +1,8 @@
 """kin-ui: local-only web UI (127.0.0.1 + per-session token).
 
-Shows the live transcript, listening state and per-process CPU/RAM, and the
-memory timeline with search and delete. The UI never opens the memory store
+Shows the live transcript, listening state and per-process CPU/RAM, the memory
+timeline with search and delete, the answers, and the egress ledger (O2: every
+online call with its exact request). The UI never opens the memory store
 itself: every memory request is forwarded to kin-core, which holds the key.
 """
 
@@ -20,6 +21,8 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import HTMLResponse
+
+from kin.sync import wait_for  # noqa: E402
 
 log = logging.getLogger("kin.ui")
 STATIC = Path(__file__).parent / "static"
@@ -181,13 +184,51 @@ def create_app(token: str, hub: Hub | None = None, core: CoreClient | None = Non
         return await memory("wipe", {"confirm": "wipe"})
 
     @app.post("/api/ask")
-    async def ask(token: str | None = Query(None), q: str = ""):
+    async def ask(token: str | None = Query(None), q: str = "", speak: bool = False):
         check(token)
         if not q.strip():
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "empty question")
         if core is None:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "kin-core is not connected")
-        return await core.call("ask", {"q": q[:300]}, timeout=60)
+        return await core.call("ask", {"q": q[:300], "speak": speak}, timeout=60)
+
+    @app.get("/api/ledger")
+    async def ledger(token: str | None = Query(None), limit: int = 100):
+        check(token)
+        return await memory("ledger", {"limit": min(max(limit, 1), 500)})
+
+    @app.get("/api/people")
+    async def people(token: str | None = Query(None)):
+        check(token)
+        return await memory("people")
+
+    @app.post("/api/mute")
+    async def mute(token: str | None = Query(None), muted: bool = True):
+        check(token)
+        return await memory("mute", {"muted": muted})
+
+    @app.post("/api/voice")
+    async def voice(token: str | None = Query(None), enabled: bool = True):
+        check(token)
+        return await memory("voice", {"enabled": enabled})
+
+    @app.post("/api/voice/test")
+    async def voice_test(token: str | None = Query(None)):
+        check(token)
+        return await memory("speak", {"text": "Hello. This is Kin. Can you hear me?"})
+
+    @app.post("/api/enrol/{action}")
+    async def enrol(action: str, token: str | None = Query(None)):
+        check(token)
+        methods = {"start": "enrol_start", "cancel": "enrol_cancel", "clear": "enrol_clear"}
+        if action not in methods:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown action {action!r}")
+        return await memory(methods[action])
+
+    @app.post("/api/consolidate")
+    async def consolidate(token: str | None = Query(None)):
+        check(token)
+        return await core.call("consolidate", {}, timeout=120) if core else await memory("consolidate")
 
     @app.get("/api/tasks")
     async def tasks(token: str | None = Query(None)):
@@ -265,7 +306,7 @@ def run(ui_q, cmd_q, stop_evt, host: str, port: int, token: str) -> None:
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False))
 
     def _watch_stop() -> None:
-        stop_evt.wait()
+        wait_for(stop_evt)
         server.should_exit = True
 
     threading.Thread(target=_watch_stop, daemon=True).start()

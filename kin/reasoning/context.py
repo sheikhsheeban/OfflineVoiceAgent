@@ -24,7 +24,7 @@ MAX_ITEM_CHARS = 360
 @dataclass
 class Item:
     id: str
-    kind: str  # "episode" | "calendar"
+    kind: str  # "episode" | "calendar" | "fact"
     when: dt.datetime
     text: str
     ref: dict = field(default_factory=dict)  # episode id, similarity, ... for the UI
@@ -32,6 +32,8 @@ class Item:
     def line(self) -> str:
         if self.kind == "calendar":
             return f"[{self.id}] Calendar: {self.text}"
+        if self.kind == "fact":
+            return f"[{self.id}] Checked online just now: {self.text}"
         return f"[{self.id}] Heard {self.when.strftime('%a %d %b %H:%M')}: {self.text}"
 
 

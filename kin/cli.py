@@ -8,7 +8,9 @@ kin search "budget"         search memory from the terminal
 kin ask "when is the site visit?"   ask Kin from the terminal (router, tools, model, gate)
 kin asr-test                say a sentence; every installed speech model transcribes it
 kin devices                 list microphones
-kin doctor                  check models, hashes and audio input
+kin doctor [--net]          check models, hashes, audio input, voice; --net proves the no-network guard
+kin wake-test               say "Hey Jarvis" ten times; shows how strongly your mic and voice trigger it
+kin consolidate             run the nightly housekeeping now (digests, merge facts, expiry)
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import statistics
 import sys
 import time
@@ -69,42 +72,11 @@ def verify_models(asr: list[str] | None = None) -> list[str]:
 
 
 def cmd_fetch_models(args) -> int:
-    # The only place Kin downloads anything; the running app never does.
-    import tarfile
-    import tempfile
-    import urllib.request
+    # The only place Kin downloads models; the running app never does (kin/fetch.py).
+    from kin.fetch import fetch_entries
 
-    for section, spec in _entries(args.asr):
-        d = MODELS_DIR / spec["dir"]
-        missing = [n for n, h in spec["files"].items() if not (d / n).exists() or _sha256(d / n) != h]
-        if not missing:
-            print(f"ok       {section}: {spec['name']}")
-            continue
-        print(f"fetching {section}: {spec['name']}")
-        d.mkdir(parents=True, exist_ok=True)
-        if "urls" in spec:
-            for n in missing:
-                urllib.request.urlretrieve(spec["urls"][n], d / n)
-        elif "url_base" in spec:
-            for n in missing:
-                urllib.request.urlretrieve(spec["url_base"] + n, d / n)
-        elif spec["url"].endswith((".tar.bz2", ".tar.gz")):
-            dest = MODELS_DIR / spec["extract_to"]
-            with tempfile.TemporaryDirectory() as tmp:
-                arc = Path(tmp) / "model.tar"
-                urllib.request.urlretrieve(spec["url"], arc)
-                with tarfile.open(arc) as tf:
-                    for m in tf.getmembers():  # refuse path traversal
-                        target = (dest / m.name).resolve()
-                        if not str(target).startswith(str(dest.resolve())) or m.issym() or m.islnk():
-                            raise SystemExit(f"unsafe path in archive: {m.name}")
-                    tf.extractall(dest)
-            if spec.get("prune"):
-                for f in d.iterdir():
-                    if f.is_file() and f.name not in spec["files"]:
-                        f.unlink()
-        else:
-            urllib.request.urlretrieve(spec["url"], d / missing[0])
+    for line in fetch_entries(_entries(args.asr), _sha256):
+        print(line)
     problems = verify_models(args.asr)
     for p in problems:
         print("ERROR", p)
@@ -114,7 +86,9 @@ def cmd_fetch_models(args) -> int:
 
 
 def _settings(args) -> Settings:
-    audio = AudioSettings(device=getattr(args, "device", None))
+    thr = getattr(args, "wake_threshold", None) or os.environ.get("KIN_WAKE_THRESHOLD")
+    audio = AudioSettings(device=getattr(args, "device", None),
+                          **({"wake_threshold": float(thr)} if thr else {}))  # fmt: skip
     return Settings(
         profile=get_profile(args.profile),
         audio=audio,
@@ -123,6 +97,10 @@ def _settings(args) -> Settings:
         asr_model=getattr(args, "asr", None),
         calendar_path=getattr(args, "calendar", None),
         warm_llm=getattr(args, "warm", False),
+        voice=getattr(args, "voice", None),
+        use_clip=not getattr(args, "no_clip", False),
+        serial_port=getattr(args, "serial_port", None),
+        gateway=not getattr(args, "no_gateway", False),
     )
 
 
@@ -238,11 +216,24 @@ def cmd_ask(args) -> int:
     from kin.memory.embed import Embedder
     from kin.memory.service import Memory
     from kin.memory.store import Store
+    from kin.reasoning.facts import FactService
 
     _require_models()
     mem = Memory(Store.open(args.db), Embedder())
+    facts = None
+    if args.online:
+        # A developer shortcut: this CLI process calls the gateway code directly. In `kin run`
+        # the same requests go to the kin-gateway process, and kin-core itself has no network.
+        from kin.gateway.server import Gateway
+
+        gw = Gateway()
+        from kin.contracts import FactResponse
+
+        facts = FactService(record=lambda r: r.ledger and mem.store.add_egress(r.ledger.model_dump()))
+        facts._call = lambda req, names: FactResponse.model_validate(  # noqa: E731
+            gw.handle({"request": req.model_dump(), "names": names}))
     try:
-        reasoner = open_reasoner(mem, get_profile(args.profile), args.calendar or default_calendar_path())
+        reasoner = open_reasoner(mem, get_profile(args.profile), args.calendar or default_calendar_path(), facts=facts)
         ans = reasoner.handle(args.question)
     finally:
         mem.store.close()
@@ -253,7 +244,102 @@ def cmd_ask(args) -> int:
     for c in ans.citations:
         print(f"  cites {c['id']}: {c['text'][:100]}")
     if ans.fact_request:
-        print(f"  would ask online (gateway, week 4): {json.dumps(ans.fact_request)}")
+        f = ans.fact or {}
+        sent = f"asked {f['host']} ({f['status']}, {f['bytes_out']} bytes out)" if f.get("host") else "nothing was sent"
+        print(f"  {sent}: {json.dumps(ans.fact_request)}")
+    if args.speak:
+        from kin.output.voice import Voice
+
+        v = Voice()
+        v.speak(ans.voice_text)
+        import time as _t
+
+        _t.sleep(0.5)
+        while v._q.qsize() or v._window and v._window[1] > _t.time():
+            _t.sleep(0.1)
+    return 0
+
+
+def cmd_wake_test(args) -> int:
+    """Measure the wake word on YOUR microphone and voice. Nothing is saved; audio stays in memory."""
+    import numpy as np
+
+    from kin.audio.capture import MicSource
+    from kin.audio.gate import frame_dbfs
+    from kin.audio.ring import Ring
+    from kin.audio.wakeword import WakeWord
+    from kin.config import FRAME, SAMPLE_RATE
+
+    _require_models()
+    ring = Ring.create(30 * SAMPLE_RATE)
+    wake = WakeWord.from_spec()
+    mic = MicSource(ring, args.device, prefer_clip=False)
+    mic.start()
+    print(f"microphone: {mic.device_name}")
+    print(f'Say "Hey Jarvis" about {args.count} times, pausing 2-3 s between, for {args.seconds:.0f} s. Go!\n')
+    cursor, t_end = ring.write_pos, time.time() + args.seconds
+    bursts: list[float] = []
+    cur_peak, quiet, level = 0.0, 0, -90.0
+    try:
+        while time.time() < t_end:
+            if ring.write_pos - cursor < FRAME:
+                time.sleep(0.01)
+                continue
+            frame = ring.read(cursor, cursor + FRAME)
+            cursor += FRAME
+            level = max(level, frame_dbfs(frame))  # the loudest frame heard
+            score = wake.feed(frame)  # every frame, no gate: this measures the model itself
+            if score is None:
+                continue
+            if score >= 0.1:
+                cur_peak, quiet = max(cur_peak, score), 0
+            elif cur_peak:
+                quiet += 1
+                if quiet > 6:  # ~0.5 s of nothing: the burst is over
+                    bursts.append(cur_peak)
+                    verdict = "TRIGGERS" if cur_peak >= 0.5 else "too weak at the default 0.5"
+                    print(f"  heard something wake-word-like: peak score {cur_peak:.2f}   ({verdict})")
+                    cur_peak = 0.0
+    finally:
+        mic.stop()
+        ring.close()
+    if cur_peak:
+        bursts.append(cur_peak)
+    print(f"\ninput level while you spoke: up to about {level:.0f} dBFS (good speech is around -30 to -15)")
+    if not bursts:
+        print("Nothing came close. Check the level above and the microphone (kin devices, --device),")
+        print("then say it louder and clearer.")
+        return 1
+    hit = sum(b >= 0.5 for b in bursts)
+    print(f"{len(bursts)} candidate bursts, {hit} at or above the default threshold 0.5")
+    good = sorted(b for b in bursts if b >= 0.2)
+    if good:
+        rec = round(0.8 * float(np.median(good)), 2)
+        rec = max(0.2, min(0.5, rec))
+        print(f"suggested threshold for your voice: {rec:.2f}")
+        print(f"  try:  uv run kin run --wake-threshold {rec:.2f}   (or set KIN_WAKE_THRESHOLD={rec:.2f})")
+    return 0
+
+
+def cmd_consolidate(args) -> int:
+    from kin.core.process import open_reasoner
+    from kin.memory.consolidate import Consolidator
+    from kin.memory.embed import Embedder
+    from kin.memory.service import Memory
+    from kin.memory.store import Store
+
+    mem = Memory(Store.open(args.db), Embedder())
+    try:
+        llm = None
+        if not args.no_model:
+            _require_models()
+            llm = open_reasoner(mem, get_profile(args.profile), None).llm
+        res = Consolidator(mem, llm).run()
+    finally:
+        mem.store.close()
+    print(f"expired episodes: {res['expired_episodes']}   merged facts: {res['merged_facts']}")
+    for d in res["digests"]:
+        print(f"  {d['day']} ({d['n_episodes']} episodes, {d['source']}): {d['text']}")
     return 0
 
 
@@ -395,8 +481,60 @@ def cmd_doctor(args) -> int:
     except Exception as e:  # noqa: BLE001
         print("language     FAILED:", e)
         ok = False
+    try:
+        from kin.output.voice import PiperEngine
+
+        eng = PiperEngine()
+        if not eng.installed():
+            raise FileNotFoundError(eng.path)
+        t0 = time.perf_counter()
+        audio, rate = eng.synth("Hello, this is Kin.")
+        ms = (time.perf_counter() - t0) * 1000
+        print(f"voice        ok: Piper, {len(audio) / rate:.1f} s of speech in {ms:.0f} ms")
+    except Exception as e:  # noqa: BLE001
+        print("voice        FAILED:", e)
+        ok = False
+    try:
+        from kin.perception.speaker import SpeakerTagger
+
+        sp = SpeakerTagger()
+        if not sp.installed():
+            raise FileNotFoundError(sp.path)
+        sp._ext()
+        print("speaker      ok: WeSpeaker voiceprint model loads")
+    except Exception as e:  # noqa: BLE001
+        print("speaker      FAILED:", e)
+        ok = False
+    if args.net:
+        ok = _doctor_net() and ok
     print("profile     ", dataclasses.asdict(get_profile(args.profile)))
     return 0 if ok else 1
+
+
+def _doctor_net() -> bool:
+    """Prove the no-network guard in a fresh process, and show what the gateway may reach."""
+    import subprocess
+
+    code = "from kin import guard; guard.install(); import json; print(json.dumps(guard.probe()))"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=30)
+    try:
+        probe = json.loads(out.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        print("network      FAILED: could not run the guard probe:", out.stderr.strip()[-200:])
+        return False
+    good = probe["blocked"] and probe["dns_blocked"]
+    print(
+        f"network      {'ok' if good else 'FAILED'}: a kin-core-style process cannot connect out "
+        f"(connect blocked: {probe['blocked']}, name lookup blocked: {probe['dns_blocked']}, layer: {probe['method']})"
+    )
+    if sys.platform.startswith("linux") and "netns" not in probe["method"]:
+        print("             (no network namespace: needs unprivileged user namespaces; only the socket guard applies)")
+    if sys.platform == "win32":
+        print("             Windows: for a second layer add a firewall rule, see docs/NETWORK.md (needs administrator)")
+    from kin.gateway.server import allowed_hosts
+
+    print("gateway      may reach only:", ", ".join(sorted(allowed_hosts())))
+    return good
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -412,18 +550,29 @@ def main(argv: list[str] | None = None) -> int:
         if device:
             p.add_argument("--device", default=None, help="input device name substring or index")
 
+    def voice_flags(p):
+        p.add_argument("--voice", dest="voice", action="store_true", default=None, help="speak answers aloud")
+        p.add_argument("--no-voice", dest="voice", action="store_false", help="text only")
+        p.add_argument("--no-clip", action="store_true", help="ignore the Kin clip; use the laptop microphone")
+        p.add_argument("--serial-port", default=None, help="the clip's serial port (default: find it)")
+        p.add_argument("--no-gateway", action="store_true", help="do not start kin-gateway (fully offline)")
+        p.add_argument("--wake-threshold", type=float, default=None,
+                       help="wake word sensitivity, default 0.5; lower is more sensitive (see `kin wake-test`)")
+
     p = sub.add_parser("fetch-models")
     p.add_argument("--asr", action="append", help="also fetch this speech model (repeatable, or 'all')")
     p.set_defaults(fn=cmd_fetch_models)
 
     p = sub.add_parser("run")
     common(p)
+    voice_flags(p)
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--no-browser", action="store_true")
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("replay")
     common(p, device=False)
+    voice_flags(p)
     p.add_argument("wav")
     p.add_argument("--speed", type=float, default=1.0)
     p.add_argument("--port", type=int, default=8765)
@@ -442,7 +591,20 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("ask", help="ask a question as if spoken after the wake word")
     common(p, device=False)
     p.add_argument("question")
+    p.add_argument("--online", action="store_true", help="allow weather/news/search lookups through the gateway code")
+    p.add_argument("--speak", action="store_true", help="say the answer aloud")
     p.set_defaults(fn=cmd_ask)
+
+    p = sub.add_parser("wake-test", help='say "Hey Jarvis" and see how strongly it triggers')
+    p.add_argument("--seconds", type=float, default=40.0)
+    p.add_argument("--count", type=int, default=10)
+    p.add_argument("--device", default=None)
+    p.set_defaults(fn=cmd_wake_test)
+
+    p = sub.add_parser("consolidate", help="run the nightly housekeeping now")
+    common(p, device=False)
+    p.add_argument("--no-model", action="store_true", help="plain extract digests, without the language model")
+    p.set_defaults(fn=cmd_consolidate)
 
     p = sub.add_parser("search")
     p.add_argument("query")
@@ -463,6 +625,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("doctor")
     common(p)
+    p.add_argument("--net", action="store_true", help="also prove the no-network guard and list the gateway allowlist")
     p.set_defaults(fn=cmd_doctor)
 
     args = ap.parse_args(argv)

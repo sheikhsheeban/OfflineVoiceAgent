@@ -1,7 +1,8 @@
 """Starts and watches the Kin processes, and measures their CPU and RAM.
 
-Week 1 runs kin-audio, kin-core and kin-ui. kin-gateway joins in week 4.
-A crashed process is restarted within 2 s (at most 5 times a minute).
+Four processes (spec CL8): kin-audio, kin-core, kin-gateway and kin-ui. A crashed
+process is restarted within 2 s (at most 5 times a minute). kin-audio and kin-core
+start with no network (kin.guard); only kin-gateway may go online.
 """
 
 from __future__ import annotations
@@ -60,6 +61,9 @@ class Supervisor:
         self.ui_q = self.ctx.Queue()
         self.ctl_q = self.ctx.Queue()
         self.cmd_q = self.ctx.Queue()  # kin-ui -> kin-core requests
+        self.audio_cmd_q = self.ctx.Queue()  # kin-core -> kin-audio: mute, LED patterns
+        self.session = secrets.token_hex(4)  # names the local IPC endpoints of this run
+        self.authkey = secrets.token_bytes(16)
         self.stop_evt = self.ctx.Event()
         self.messages: list[dict] = []  # headless mode: what the UI would have shown
         self.stats_history: list[dict] = []
@@ -75,11 +79,13 @@ class Supervisor:
         from kin.audio import process as audio_proc
         from kin.core import process as core_proc
 
+        voice = settings.voice if settings.voice is not None else source == "mic"
         self.children = [
             Child(
                 "kin-audio",
                 audio_proc.run,
-                (self.ring.name, self.events_q, self.stop_evt, settings.audio, source, speed),
+                (self.ring.name, self.events_q, self.stop_evt, settings.audio, source, speed, self.audio_cmd_q,
+                 settings.serial_port, settings.use_clip),
             ),
             Child(
                 "kin-core",
@@ -96,9 +102,17 @@ class Supervisor:
                     self.asr_model,
                     settings.calendar_path or default_calendar_path(),
                     settings.warm_llm,
+                    self.session if settings.gateway else None,
+                    self.authkey,
+                    self.audio_cmd_q,
+                    voice,
                 ),
             ),
         ]
+        if settings.gateway:
+            from kin.gateway import server as gateway_server
+
+            self.children.append(Child("kin-gateway", gateway_server.run, (self.session, self.authkey, self.stop_evt)))
         if ui:
             from kin.ui import app as ui_app
 
@@ -118,6 +132,8 @@ class Supervisor:
         # kin-core loads its models before kin-audio starts, so no speech is
         # queued against a core that cannot transcribe it yet.
         by_name = {c.name: c for c in self.children}
+        if "kin-gateway" in by_name:
+            by_name["kin-gateway"].start(self.ctx)
         by_name["kin-core"].start(self.ctx)
         if "kin-ui" in by_name:
             by_name["kin-ui"].start(self.ctx)
@@ -257,7 +273,7 @@ class Supervisor:
             self._drain_ui()
         if self._csv:
             self._csv[0].close()
-        for q in (self.events_q, self.ui_q, self.ctl_q, self.cmd_q):
+        for q in (self.events_q, self.ui_q, self.ctl_q, self.cmd_q, self.audio_cmd_q):
             q.cancel_join_thread()
             q.close()
         self.ring.close()

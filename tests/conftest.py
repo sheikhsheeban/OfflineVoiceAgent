@@ -11,6 +11,8 @@ os.environ["KIN_DB_KEY"] = "ab" * 32
 
 import pytest  # noqa: E402
 
+pytest_plugins = ["tests.engine_fixtures"]
+
 from kin.cli import verify_models  # noqa: E402
 from kin.perception.textmetrics import wer  # noqa: E402, F401  (re-exported for tests)
 

@@ -5,8 +5,9 @@ import datetime as dt
 import pytest
 from pydantic import ValidationError
 
+from kin.contracts import FactRequest
 from kin.reasoning.calendar import Calendar
-from kin.reasoning.facts import FactRequest, FactService, FactUnavailable, build_request
+from kin.reasoning.facts import FactService, build_request, unavailable_text
 from tests.conftest import DATA
 
 NOW = dt.datetime(2026, 9, 30, 10, 40)
@@ -48,9 +49,10 @@ def test_search_requests_drop_names_and_sensitive_numbers():
     assert "Wardha" in r.q and len(r.q) <= 80
 
 
-def test_no_gateway_yet():
-    with pytest.raises(FactUnavailable, match="can't check the weather right now"):
-        FactService().fetch(FactRequest(kind="weather", lat=21.1, lon=79.1))
+def test_no_gateway_means_offline_not_a_crash():
+    resp = FactService().fetch(FactRequest(kind="weather", lat=21.1, lon=79.1))
+    assert not resp.ok and resp.error == "offline" and resp.ledger is None  # nothing was sent, so no ledger row
+    assert unavailable_text(resp) == "I can't check the weather right now."
 
 
 def test_calendar_reads_events_and_finds_relevant_ones():

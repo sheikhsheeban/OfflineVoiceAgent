@@ -7,7 +7,9 @@
 | task.list     | rules                                              |
 | reminder.set  | rules + scheduler                                  |
 | digest.today  | stored tasks and episodes, no model                |
-| fact.*        | fact request (model + grammar), gateway in week 4  |
+| fact.*        | typed fact request -> kin-gateway -> forecast/news |
+| general.knowledge | the model alone, with a "may be out of date" note |
+| meta.history  | the turns log (last question, repeat), no model    |
 | unsupported   | honest decline, offer to save a note               |
 
 Every model call happens on kin-core's heavy lane (the caller's thread).
@@ -21,12 +23,15 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 
+from kin.output.voice import spoken_form
+from kin.perception.filters import redact
 from kin.reasoning import context as ctx
 from kin.reasoning import gate
 from kin.reasoning.calendar import Calendar
-from kin.reasoning.facts import FactService, FactUnavailable, build_request
+from kin.reasoning.facts import FactService, build_request, unavailable_text
+from kin.reasoning.facts import describe as describe_fact
 from kin.reasoning.llm import LLMUnavailable, load_grammar, load_prompt
-from kin.reasoning.router import Router
+from kin.reasoning.router import _CURRENT, Router
 from kin.reasoning.timeparse import WEEKDAYS, describe, parse_when
 
 log = logging.getLogger("kin.reasoning")
@@ -44,6 +49,13 @@ _RELATIVE_DAY = re.compile(
     r"\b(today|tonight|tomorrow|yesterday|this (morning|afternoon|evening|week)|next|last|ago)\b", re.I
 )
 _VAGUE_WHEN = re.compile(r"\b(after|before|later|soon|this week|end of|when i|once)\b", re.I)
+_FOLLOWUP = re.compile(r"^\s*(and|what about|how about|also|then|so)\b|^\s*(it|that|they|he|she|there)\b", re.I)
+# "What is X" style questions that memory cannot answer and general knowledge can.
+_GENERIC = re.compile(r"^\s*(what (is|are|does)|define|explain|how (does|do|is|are)|why (is|do|does))\b", re.I)
+_PERSONAL_WORDS = re.compile(r"\b(my|mine|me|i|we|our|us|yesterday|last|earlier|said|told|mentioned)\b", re.I)
+_REPEAT = re.compile(r"\b(repeat|say that again|what did you)", re.I)
+CONVERSATION_S = 300.0  # the buffer of recent turns resets after five minutes of silence
+BUFFER_TURNS = 4
 
 
 @dataclass
@@ -60,6 +72,9 @@ class Answer:
     offer_note: bool = False
     llm_used: bool = False
     timings: dict = field(default_factory=dict)
+    voice_text: str = ""  # what is said aloud: no ids, at most ~120 tokens
+    abstained: bool = False  # Kin declined or could not check: nothing was asserted
+    fact: dict | None = None  # what the gateway did: kind, ok, error, host, bytes
 
     def to_dict(self) -> dict:
         return {"type": "answer", **asdict(self), "t": time.time()}
@@ -75,13 +90,16 @@ def _clean_title(text: str) -> str:
 
 
 class Reasoner:
-    def __init__(self, memory, llm, calendar: Calendar | None = None, facts: FactService | None = None, clock=None):
+    def __init__(
+        self, memory, llm, calendar: Calendar | None = None, facts: FactService | None = None, clock=None, on_state=None
+    ):
         self.memory = memory
         self.llm = llm
         self.router = Router(memory.embedder, llm, memory_probe=self._memory_has)
         self.calendar = calendar or Calendar(None)
         self.facts = facts or FactService()
         self.clock = clock or dt.datetime.now
+        self.on_state = on_state or (lambda reason, active: None)  # O1: thinking / fetching
 
     def warm(self) -> None:
         """Load the model and evaluate the fixed start of the answer prompt, so the first
@@ -100,20 +118,103 @@ class Reasoner:
     def handle(self, question: str) -> Answer:
         t0 = time.perf_counter()
         question = question.strip()
-        route = self.router.route(question)
-        t_route = time.perf_counter()
-        handler = {
-            "recall.query": self._recall,
-            "task.add": self._task_add,
-            "task.list": self._task_list,
-            "reminder.set": self._reminder,
-            "digest.today": self._digest,
-            "unsupported": self._unsupported,
-        }.get(route.intent, self._fact)
-        ans = handler(question, route)
+        prev = self._recent_turns()
+        effective = self._resolve_followup(question, prev)
+        self.on_state("thinking", True)
+        try:
+            route = self.router.route(question)  # rules see only what was actually said
+            if effective != question:
+                base = prev[-1]["intent"].split("+")[0]
+                if route.method != "rules" and base in ("recall.query", "fact.weather", "fact.news"):
+                    # "and on Friday?" continues the last topic (a general-knowledge answer is not one to continue)
+                    route.intent, route.method = base, "followup"
+                route.q_ret = effective
+            t_route = time.perf_counter()
+            handler = {
+                "recall.query": self._recall,
+                "task.add": self._task_add,
+                "task.list": self._task_list,
+                "reminder.set": self._reminder,
+                "digest.today": self._digest,
+                "general.knowledge": self._general,
+                "meta.history": self._history,
+                "unsupported": self._unsupported,
+            }.get(route.intent, self._fact)
+            ans = handler(question, route)
+        finally:
+            self.on_state("thinking", False)
         ans.timings = {"route_ms": round((t_route - t0) * 1000, 1), **ans.timings,
                        "total_ms": round((time.perf_counter() - t0) * 1000, 1)}  # fmt: skip
+        ans.voice_text = spoken_form(ans.text)
+        ans.abstained = ans.abstained or ans.gate in ("no_memory", "fact_unavailable") or ans.intent == "unsupported"
+        self._log_turn(question, ans)
         log.info("answer [%s/%s, %s] %s", ans.intent, ans.route, ans.gate or "-", ans.text)
+        return ans
+
+    # -- conversation (section 11: turns, R7) --------------------------------------------
+
+    def _recent_turns(self) -> list[dict]:
+        """The last few exchanges; empty after five minutes of silence."""
+        return self.memory.store.turns(BUFFER_TURNS, since=self.clock().timestamp() - CONVERSATION_S)
+
+    @staticmethod
+    def _is_followup(q: str, prev: list[dict]) -> bool:
+        """A short reply that leans on the last exchange ("and on Friday?", "what about Rohan?")."""
+        return bool(prev) and bool(_FOLLOWUP.search(q))
+
+    @staticmethod
+    def _resolve_followup(q: str, prev: list[dict]) -> str:
+        """A follow-up is searched together with the question before it."""
+        return f"{q} {prev[-1]['question']}" if Reasoner._is_followup(q, prev) else q
+
+    def _conversation(self, prev: list[dict]) -> str:
+        if not prev:
+            return ""
+        lines = "\n".join(f"You asked: {t['question']}\nKin said: {t['answer'][:160]}" for t in prev)
+        return f"Earlier in this conversation:\n{lines}\n"
+
+    def _log_turn(self, question: str, ans: Answer) -> None:
+        """E39: every exchange is kept (filtered, encrypted, seven days)."""
+        try:
+            self.memory.store.add_turn(
+                redact(question).text, ans.intent, redact(ans.text).text, [c.get("id") for c in ans.citations],
+                ts=self.clock().timestamp(),
+            )  # fmt: skip
+        except Exception:  # noqa: BLE001 - a logging failure must not lose the answer
+            log.exception("could not log the turn")
+
+    def _history(self, q: str, route) -> Answer:
+        turns = self.memory.store.turns(1)
+        ans = Answer(q, "", "meta.history", route.method, gate="history")
+        if not turns:
+            ans.text = "We haven't talked yet."
+        elif _REPEAT.search(q):
+            ans.text = turns[-1]["answer"]
+        else:
+            ans.text = f"You asked: {turns[-1]['question']}"
+        return ans
+
+    def _general(self, q: str, route) -> Answer:
+        """Built-in knowledge, offline, with a note that it may be out of date."""
+        ans = Answer(q, "", "general.knowledge", route.method)
+        try:
+            t = time.perf_counter()
+            out = self.llm.complete(load_prompt("general").replace("{{QUESTION}}", q), max_tokens=70, stop=["\n\n"])
+            ans.llm_used = True
+            ans.timings["llm_ms"] = round((time.perf_counter() - t) * 1000, 1)
+        except LLMUnavailable as e:
+            log.warning("no model for a general question: %s", e)
+            ans.gate = "retrieval_only"
+            ans.text = "I can't answer general questions right now: my language model isn't loaded."
+            ans.abstained = True
+            return ans
+        text = out.text.strip()
+        if not text or text.lower().startswith("i'm not sure") or text.lower().startswith("i don't"):
+            ans.gate, ans.abstained = "unsure", True
+            ans.text = "I'm not sure about that, and I can't look it up offline."
+            return ans
+        ans.gate = "general"
+        ans.text = f"{text} That's from general knowledge, so it may be out of date."
         return ans
 
     # -- recall --------------------------------------------------------------------------
@@ -121,23 +222,36 @@ class Reasoner:
     def _recall(self, q: str, route) -> Answer:
         now = self.clock()
         ans = Answer(q, "", "recall.query", route.method)
-        fact_note = ""
+        q_ret = getattr(route, "q_ret", None) or q  # a follow-up is searched with the question before it
         if route.also:
             ans.intent = f"recall.query+{route.also}"
-            fact_note = self._fact_part(q, route.also, ans, people=self._people(q))
 
         t = time.perf_counter()
-        qvec = self.memory.embedder.embed_one(q)
-        hits = gate.relevant(self.memory.search(q, k=4, qvec=qvec))
-        when = parse_when(q, now)
-        events = self.calendar.relevant(" ".join([q] + [h["text"] for h in hits[:2]]), now,
+        qvec = self.memory.embedder.embed_one(q_ret)
+        hits = gate.relevant(self.memory.search(q_ret, k=4, qvec=qvec))
+        when = parse_when(q_ret, now)
+        events = self.calendar.relevant(" ".join([q_ret] + [h["text"] for h in hits[:2]]), now,
                                         when.at.date() if when else None)  # fmt: skip
         ans.timings["retrieve_ms"] = round((time.perf_counter() - t) * 1000, 1)
+
+        if not hits and not events and not route.also and self._generic(q):
+            return self._general(q, route)  # "what is Python?" with nothing remembered about it
+
+        fact_item, fact_note, fact_text = None, "", ""
+        if route.also:
+            target = when.at if when else self._target_from_memory(hits, events)
+            fact_text, ok = self._lookup(q, route.also, ans, self._people(q), target)
+            if ok:
+                kind = "forecast" if route.also == "fact.weather" else "online"
+                fact_item = ctx.Item(kind, "fact", now, fact_text, {"fact": kind})
+            else:
+                fact_note = fact_text
+
         if not hits and not events:
             ans.gate = "no_memory"
-            ans.text = self._join(gate.NO_MEMORY, fact_note)
+            ans.text = self._join(gate.NO_MEMORY, fact_text if fact_item else fact_note)
             return ans
-        items = ctx.build(hits, events, q)
+        items = ctx.build(hits, events, q) + ([fact_item] if fact_item else [])
 
         conflict = gate.find_conflict(items)
         if conflict:
@@ -147,13 +261,13 @@ class Reasoner:
             ans.text = self._join(
                 f'I heard two different things. {self._when(a)}: "{a.text[:140]}" '
                 f'But {self._when(b).lower()}: "{b.text[:140]}" Which one is right?',
-                fact_note,
+                fact_text if fact_item else fact_note,
             )
             return ans
 
-        if route.also:
-            # Memory plus a live fact. Without the fact the model tends to decline the whole
-            # question, so the local part is read back directly and the fact part explained.
+        if route.also and fact_item is None:
+            # The fact could not be fetched. The local part is read back directly and the
+            # missing part explained plainly (flow F5).
             best = gate.best_sentence(items, q)
             if best is None:
                 ans.gate = "no_memory"
@@ -165,10 +279,10 @@ class Reasoner:
             ans.text = self._join(self._read_back(sentence, item), fact_note)
             return ans
 
-        extra = ""
+        prev = self._recent_turns()
         prompt = (
             load_prompt("answer")
-            .replace("{{EXTRA}}", extra)
+            .replace("{{EXTRA}}", self._conversation(prev))
             .replace("{{CONTEXT}}", ctx.render(items))
             # The date only when the question is relative to it: a small model otherwise
             # copies today's weekday into answers about other days.
@@ -192,32 +306,33 @@ class Reasoner:
         if result.ok:
             ans.gate = "grounded"
             ans.citations = [_cite(c) for c in result.cites]
-            ans.text = self._join(out.text, fact_note)
+            ans.text = out.text
             return ans
         if result.reason == "declined":
             # The small model often says "nothing" for a plain "what is X" even when a memory
             # mentions X. If retrieval was confident, read the memory back instead.
-            best = gate.best_sentence(items, q) if self._confident(hits, q) else None
+            # (a calendar entry that matched the question counts as confident too)
+            best = gate.best_sentence(items, q) if (self._confident(hits, q) or events) else None
             if best is None:
                 ans.gate = "no_memory"
-                ans.text = self._join(gate.NO_MEMORY, fact_note)
+                ans.text = self._join(gate.NO_MEMORY, fact_text if fact_item else fact_note)
                 return ans
             sentence, item = best
             ans.gate = "fallback"
             ans.citations = [_cite(item)]
-            ans.text = self._join(self._read_back(sentence, item), fact_note)
+            ans.text = self._join(self._read_back(sentence, item), fact_text if fact_item else "")
             return ans
-        # Ungrounded, vague or no model: read back the best remembered sentence.
-        best = gate.best_sentence(items, q)
+        # Ungrounded, vague or no model: read back the best remembered sentence (and the fact, verbatim).
+        best = gate.best_sentence([i for i in items if i.kind != "fact"] or items, q)
         ans.gate = result.reason if result.reason != "vague" else "fallback"
         if result.reason == "ungrounded":
             log.info("gate rejected %r: unsupported %s", out.text if out else "", result.unsupported)
         if best is None:
-            ans.text = self._join(gate.NO_MEMORY, fact_note)
+            ans.text = self._join(gate.NO_MEMORY, fact_text if fact_item else fact_note)
             return ans
         sentence, item = best
-        ans.citations = [_cite(item)]
-        ans.text = self._join(self._read_back(sentence, item), fact_note)
+        ans.citations = [_cite(item)] + ([_cite(fact_item)] if fact_item else [])
+        ans.text = self._join(self._read_back(sentence, item), fact_text if fact_item else "")
         return ans
 
     @staticmethod
@@ -231,6 +346,21 @@ class Reasoner:
         if words and len(words & ctx.content_words(top.get("text", ""))) / len(words) >= 0.6:
             return True
         return (top.get("vector_similarity") or 0.0) >= 0.55
+
+    @staticmethod
+    def _generic(q: str) -> bool:
+        return bool(_GENERIC.search(q)) and not _PERSONAL_WORDS.search(q) and not _CURRENT.search(q)
+
+    def _target_from_memory(self, hits: list[dict], events) -> dt.datetime | None:
+        """The moment a remembered plan is for ("site visit Thursday at 4 pm"), for the forecast window."""
+        for e in events:
+            if not e.all_day and e.start > self.clock():
+                return e.start
+        for h in hits:
+            when = parse_when(h["text"], dt.datetime.fromtimestamp(h["started_at"]))
+            if when is not None and when.at > self.clock():
+                return when.at
+        return None
 
     def _read_back(self, sentence: str, item: ctx.Item) -> str:
         if item.kind == "calendar":
@@ -249,20 +379,35 @@ class Reasoner:
 
     # -- facts ---------------------------------------------------------------------------
 
-    def _fact_part(self, q: str, intent: str, ans: Answer, people: set[str]) -> str:
+    def _known_names(self, people: set[str]) -> list[str]:
+        """Names the gateway must keep out of a search: people in the question and in memory."""
+        return sorted(people | {p["name"] for p in self.memory.store.people()})
+
+    def _lookup(self, q: str, intent: str, ans: Answer, people: set[str], target: dt.datetime | None = None):
+        """One typed request through the gateway. Returns (sentence, ok); the sentence is the
+        fact in words, or the plain reason it could not be checked."""
+        now = self.clock()
         t = time.perf_counter()
         llm = self.llm if self.llm is not None and self.llm.installed() else None
         try:
-            req = build_request(intent, q, self.clock(), llm=llm, people=people)
+            req = build_request(intent, q, now, llm=llm, people=people, when_at=target)
         except LLMUnavailable:
-            req = build_request(intent, q, self.clock(), llm=None, people=people)
+            req = build_request(intent, q, now, llm=None, people=people, when_at=target)
         ans.fact_request = req.payload()
-        ans.timings["fact_ms"] = round((time.perf_counter() - t) * 1000, 1)
+        self.on_state("fetching", True)
         try:
-            self.facts.fetch(req)
-            return ""
-        except FactUnavailable as e:
-            return f"I {e}."
+            resp = self.facts.fetch(req, names=self._known_names(people))
+        finally:
+            self.on_state("fetching", False)
+        ans.timings["fetch_ms"] = round((time.perf_counter() - t) * 1000, 1)
+        led = resp.ledger
+        ans.fact = {"kind": resp.kind, "ok": resp.ok, "error": resp.error, "host": led.host if led else None,
+                    "bytes_out": led.bytes_out if led else 0, "status": led.status if led else "not sent"}  # fmt: skip
+        if resp.ok:
+            when = parse_when(q, now)
+            has_time = when.has_time if when is not None else True  # a time remembered from speech is a time
+            return describe_fact(resp, now, target, has_time), True
+        return unavailable_text(resp), False
 
     def _fact(self, q: str, route) -> Answer:
         if route.intent == "fact.search":
@@ -271,8 +416,16 @@ class Reasoner:
             if any(h["keyword_match"] for h in gate.relevant(hits)):
                 route.also, route.method = "fact.search", "mixed"
                 return self._recall(q, route)
-        ans = Answer(q, "", route.intent, route.method, gate="fact_unavailable")
-        ans.text = self._fact_part(q, route.intent, ans, people=self._people(q))
+        ans = Answer(q, "", route.intent, route.method)
+        when = parse_when(q, self.clock())
+        text, ok = self._lookup(q, route.intent, ans, people=self._people(q), target=when.at if when else None)
+        ans.text = text
+        if ok:
+            kind = {"fact.weather": "forecast", "fact.news": "news", "fact.search": "online"}[route.intent]
+            ans.gate = "fact"
+            ans.citations = [{"id": kind, "kind": "fact", "when": time.time(), "text": text[:200]}]
+        else:
+            ans.gate = "fact_unavailable"
         return ans
 
     # -- tasks and reminders ---------------------------------------------------------------

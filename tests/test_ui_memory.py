@@ -131,7 +131,7 @@ def test_week3_endpoints_are_forwarded(client):
     assert c.post(f"/api/reminders/2/cancel?{t}").json() == {"ok": "reminder_cancel"}
     assert c.post(f"/api/notes?{t}&text=Buy milk").json() == {"ok": "note_add"}
     assert fake.calls == [
-        ("ask", {"q": "When is the site visit?"}),
+        ("ask", {"q": "When is the site visit?", "speak": False}),
         ("tasks", {}),
         ("task_set", {"id": 4, "status": "open"}),
         ("task_set", {"id": 4, "status": "done"}),

@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     utterance_id INTEGER REFERENCES utterances(id) ON DELETE SET NULL,
     quote        TEXT,
     created_at   REAL    NOT NULL,
-    done_at      REAL
+    done_at      REAL,
+    notified_at  REAL                                -- when Kin last told the user it was due
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, due_at);
 
@@ -86,3 +87,62 @@ CREATE TABLE IF NOT EXISTS reminders (
     fired_at   REAL
 );
 CREATE INDEX IF NOT EXISTS reminders_due ON reminders(status, fire_at);
+
+-- People named in speech (P5). Rows exist only while some stored episode mentions them;
+-- deleting or forgetting that speech removes them. Expiry of old transcripts keeps them.
+CREATE TABLE IF NOT EXISTS people (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    aliases    TEXT NOT NULL DEFAULT '',
+    first_seen REAL NOT NULL,
+    last_seen  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS person_mentions (
+    person_id  INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+    episode_id INTEGER            -- NULL once the transcript has expired
+);
+CREATE INDEX IF NOT EXISTS person_mentions_ep ON person_mentions(episode_id);
+
+-- Claims someone made ("Rohan said the site visit is Thursday"), with the episodes they came from.
+CREATE TABLE IF NOT EXISTS facts (
+    id         INTEGER PRIMARY KEY,
+    subject    TEXT NOT NULL,
+    claim      TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS fact_sources (
+    fact_id    INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
+    episode_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS fact_sources_ep ON fact_sources(episode_id);
+
+-- One summary per day, written overnight (M3). Kept a year; deleted with the speech it summarises.
+CREATE TABLE IF NOT EXISTS digests (
+    day        TEXT PRIMARY KEY,   -- YYYY-MM-DD, local
+    text       TEXT NOT NULL,
+    n_episodes INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+
+-- Every exchange with Kin (spec section 11). Kept 7 days like transcripts.
+CREATE TABLE IF NOT EXISTS turns (
+    id        INTEGER PRIMARY KEY,
+    ts        REAL NOT NULL,
+    question  TEXT NOT NULL,
+    intent    TEXT NOT NULL,
+    answer    TEXT NOT NULL,
+    citations TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS turns_ts ON turns(ts);
+
+-- Every online call, with the exact request that was sent (CL3: the single source of truth).
+CREATE TABLE IF NOT EXISTS egress_log (
+    id        INTEGER PRIMARY KEY,
+    ts        REAL NOT NULL,
+    host      TEXT NOT NULL,
+    payload   TEXT NOT NULL,
+    bytes_out INTEGER NOT NULL,
+    bytes_in  INTEGER NOT NULL,
+    status    TEXT NOT NULL
+);

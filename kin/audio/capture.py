@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from kin.audio.ring import Ring
-from kin.config import FRAME, SAMPLE_RATE
+from kin.config import CHUNK, SAMPLE_RATE
 
 
 def find_input_device(want: str | int | None) -> int | None:
@@ -31,10 +31,29 @@ def find_input_device(want: str | int | None) -> int | None:
     raise LookupError(f"no input device matching {want!r}; run `kin devices`")
 
 
+def find_clip_device() -> int | None:
+    """The Kin clip's microphone, if it is plugged in (selected by its USB name, CL4)."""
+    import sounddevice as sd
+
+    from kin.audio.clip_serial import CLIP_NAME
+
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0 and CLIP_NAME.lower() in d["name"].lower():
+            return i
+    return None
+
+
 class MicSource:
-    def __init__(self, ring: Ring, device: str | int | None = None):
+    """A PortAudio input stream. With no device named, the Kin clip is used when present,
+    else the laptop's own microphone."""
+
+    def __init__(self, ring: Ring, device: str | int | None = None, prefer_clip: bool = True):
         self.ring = ring
         self.device = find_input_device(device)
+        self.is_clip = False
+        if self.device is None and prefer_clip:
+            self.device = find_clip_device()
+            self.is_clip = self.device is not None
         self.overflows = 0
         self.finished = threading.Event()  # set if the device disappears
         self._stream = None
@@ -47,9 +66,10 @@ class MicSource:
     def start(self) -> None:
         import sounddevice as sd
 
+        self.finished.clear()
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
-            blocksize=FRAME,
+            blocksize=CHUNK,  # 80 ms: one wake-word step per callback
             channels=1,
             dtype="int16",
             device=self.device,
@@ -57,6 +77,17 @@ class MicSource:
             finished_callback=self.finished.set,
         )
         self._stream.start()
+
+    def pause(self) -> None:
+        """Mute: stop capturing altogether (the stream is closed, not just ignored)."""
+        self.stop()
+        self.finished.clear()
+
+    def resume(self) -> None:
+        if self._stream is None:
+            if self.is_clip:  # the clip may have re-enumerated while its power was off
+                self.device = find_clip_device()
+            self.start()
 
     @property
     def device_name(self) -> str:
@@ -67,9 +98,22 @@ class MicSource:
 
     def stop(self) -> None:
         if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:  # noqa: BLE001 - the device may already be gone
+                pass
             self._stream = None
+
+
+def fall_back_to_laptop_mic(lost: "MicSource", ring: Ring) -> tuple["MicSource", dict]:
+    """The clip disappeared while Kin was running: carry on with the laptop's own microphone
+    and describe what happened for the screen (sheet 8, "clip unplugged mid-demo")."""
+    name = lost.device_name
+    lost.stop()
+    new = MicSource(ring, None, prefer_clip=False)
+    new.start()
+    return new, {"type": "audio_fallback", "lost": name, "device": new.device_name, "t": time.time()}
 
 
 def load_wav(path: str | Path) -> np.ndarray:
@@ -104,12 +148,12 @@ class WavSource:
         self._thread.start()
 
     def _run(self) -> None:
-        period = FRAME / SAMPLE_RATE / self.speed if self.speed > 0 else 0.0
+        period = CHUNK / SAMPLE_RATE / self.speed if self.speed > 0 else 0.0
         t_next = time.perf_counter()
-        for i in range(0, len(self.audio) - FRAME + 1, FRAME):
+        for i in range(0, len(self.audio) - CHUNK + 1, CHUNK):
             if self._stop.is_set():
                 break
-            self.ring.write(self.audio[i : i + FRAME])
+            self.ring.write(self.audio[i : i + CHUNK])
             if period:
                 t_next += period
                 delay = t_next - time.perf_counter()

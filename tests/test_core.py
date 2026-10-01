@@ -25,7 +25,7 @@ class FakeASR:
     def transcribe(self, audio):
         self.gate.wait(5)
         self.seen.append(int(audio[0]))
-        return AsrResult(f"hey jarvis segment {int(audio[0])}", len(audio) / 16000, 1.0)
+        return AsrResult(f"the segment {int(audio[0])}", len(audio) / 16000, 1.0)
 
 
 @pytest.fixture
@@ -68,7 +68,7 @@ def test_transcribes_and_wipes_audio(setup):
     core.handle(eos())
     msgs = drain(ui_q, "eos")
     (tr,) = [m for m in msgs if m["type"] == "transcript"]
-    assert tr["text"] == "hey jarvis segment 5" and tr["command"] is None
+    assert tr["text"] == "the segment 5" and tr["command"] is None
     assert (ring.read(16000, 32000) == 0).all(), "decoded audio must be zeroed"
     assert (ring.read(0, 16000) == 5).all(), "audio outside the segment is untouched"
     assert ctl_q.get(timeout=1)["type"] == "eos"
@@ -89,7 +89,7 @@ def test_commands_jump_the_queue(setup):
     msgs = drain(ui_q, "eos")
     assert asr.seen == [1, 3, 2]
     cmd = [m for m in msgs if m["type"] == "transcript" and m["wake"]][0]
-    assert cmd["command"] == "Segment 3"
+    assert cmd["command"] == "The segment 3"
 
 
 def test_overrun_is_reported_not_fatal(setup):

@@ -19,7 +19,8 @@ MODELS_DIR = Path(os.environ.get("KIN_MODELS_DIR", ROOT / "models"))
 RUNS_DIR = Path(os.environ.get("KIN_RUNS_DIR", ROOT / "runs"))
 
 SAMPLE_RATE = 16_000
-FRAME = 512  # 32 ms: the Silero v5 window at 16 kHz and the capture block size
+FRAME = 512  # 32 ms: the Silero v5 window at 16 kHz (VAD and gate work in these)
+CHUNK = 1280  # 80 ms: the capture block, and the openWakeWord step
 RING_SECONDS = 30
 
 # Libraries must never phone home (privacy invariant, sheet 9).
@@ -63,7 +64,12 @@ class AudioSettings:
     min_segment_ms: int = 250
     max_segment_ms: int = 20_000
     wake_threshold: float = 0.5
+    wake_patience: int = 2  # consecutive 80 ms chunks at or above the threshold
     wake_refractory_ms: int = 2_000
+    wake_span_ms: int = 1_300  # how far back from detection the wake phrase is taken to start
+    wake_noise_suppression: bool = True  # SpeexDSP, where the speexdsp_ns package is available
+    command_wait_ms: int = 1_500  # silence allowed after the wake word before the command starts
+    command_max_ms: int = 8_000  # a command ends this long after the wake word, whatever happens
     status_hz: float = 5.0
 
 
@@ -77,6 +83,10 @@ class Settings:
     asr_model: str | None = None  # default: per profile, see asr_model_name()
     calendar_path: str | None = None  # default: data/calendar.ics if present (or $KIN_CALENDAR)
     warm_llm: bool = False  # load the language model at start-up instead of on first use
+    voice: bool | None = None  # spoken replies; None = on for the microphone, off for replays
+    use_clip: bool = True  # prefer the Kin clip's microphone when it is plugged in
+    serial_port: str | None = None  # the clip's serial port; None = find it
+    gateway: bool = True  # start kin-gateway (the only process that may go online)
 
 
 def load_model_spec() -> dict:

@@ -151,6 +151,29 @@ def wake_phrase_pattern(phrase: str) -> re.Pattern[str]:
     return re.compile(rf"^\W*(?:a\W+)?{head}{words[-1]}\W*", re.IGNORECASE)
 
 
-def strip_wake_phrase(text: str, pattern: re.Pattern[str]) -> str:
-    rest = pattern.sub("", text, count=1).strip()
+def wake_text_pattern(phrase: str) -> re.Pattern[str]:
+    """The wake phrase at the start of a transcript: "hey jarvis", "a jarvis" (as ASR often hears it) or
+    just "jarvis". The safety net when the acoustic wake word missed."""
+    words = [re.escape(w) for w in phrase.lower().split()]
+    lead = r"\W+".join(words[:-1])
+    return re.compile(rf"^\W*(?:(?:{lead}|a)\W+)?{words[-1]}\b", re.IGNORECASE)
+
+
+def wake_anywhere_pattern(phrase: str) -> re.Pattern[str]:
+    """The wake phrase anywhere, up to and including the punctuation after it."""
+    words = [re.escape(w) for w in phrase.lower().split()]
+    lead = r"\W+".join(words[:-1])
+    return re.compile(rf"\b(?:(?:{lead}|a)\W+)?{words[-1]}\b\W*", re.IGNORECASE)
+
+
+def strip_wake_phrase(text: str, pattern: re.Pattern[str], anywhere: re.Pattern[str] | None = None,
+                      within: int = 40) -> str:  # fmt: skip
+    """The command without its wake phrase. With `anywhere`, also drops a few words heard before the
+    phrase (the end of an ambient sentence that fell inside the command window)."""
+    m = pattern.match(text)
+    if m is None and anywhere is not None:
+        m = anywhere.search(text)
+        if m is not None and m.start() > within:
+            m = None
+    rest = (text[m.end() :] if m else text).strip()
     return rest[:1].upper() + rest[1:] if rest else ""

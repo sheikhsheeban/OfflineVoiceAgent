@@ -22,6 +22,14 @@ FACT_INTENTS = ("fact.weather", "fact.search", "fact.news")
 # High-precision patterns that beat embeddings on short, formulaic requests.
 _RULES: list[tuple[str, re.Pattern[str]]] = [
     (
+        "meta.history",  # about the conversation itself: answered from the turns log, never by the model
+        re.compile(
+            r"\bwhat (was|is) my (last|previous|latest) (question|request)\b|\bwhat did i (just )?(ask|say)( you)?\b"
+            r"|\b(repeat|say) (that|it)( again)?\b|\bwhat did you (just )?say\b|\bsay that again\b",
+            re.I,
+        ),
+    ),
+    (
         "reminder.set",
         re.compile(
             r"\b(remind|tell|ping|wake|alert)\s+me\b.*\b(in|after)\s+(\d+|a|an|half|one|two|three|five|ten|fifteen|twenty|thirty)\b"
@@ -57,6 +65,12 @@ _QUESTION = re.compile(
     r"\?\s*$|^\s*(what|when|where|who|whom|whose|which|why|how|did|does|do|is|are|was|were|should|can|could|will)\b",
     re.I,
 )
+# A question that needs today's world, not built-in knowledge: it may go online instead.
+_CURRENT = re.compile(
+    r"\b(today|tonight|right now|currently|latest|current|this (week|month|year)|news|price of|stock|score|"
+    r"who won|traffic|is it open|open now)\b",
+    re.I,
+)
 _PERSONAL = re.compile(r"\b(my|mine|me|i|i'm|i've|we|our|us)\b", re.I)
 
 # A fact question that also points back at something heard needs both sides.
@@ -73,6 +87,7 @@ class Route:
     method: str  # "rules" | "centroid" | "model" | "mixed"
     scores: dict[str, float] = field(default_factory=dict)
     also: str | None = None  # a second intent to serve alongside (mixed recall + fact)
+    q_ret: str | None = None  # the question with the one before it, for a follow-up
 
     @property
     def top(self) -> list[tuple[str, float]]:
@@ -107,6 +122,11 @@ class Router:
             if pattern.search(text):
                 return Route(intent, "rules", scores)
         (i1, s1), (i2, s2) = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:2]
+        if i1 == "general.knowledge" and not _PERSONAL.search(text):
+            if _CURRENT.search(text):
+                return Route("fact.search", "centroid", scores)  # general knowledge would be out of date
+            if self.memory_probe is not None and self.memory_probe(text):
+                return Route("recall.query", "memory", scores)  # what the user said about it comes first
         if i1 in FACT_INTENTS and _MEMORY_CUE.search(text):
             return Route("recall.query", "mixed", scores, also=i1)
         if i1 == "recall.query":
@@ -116,7 +136,9 @@ class Router:
         unsure = s1 < self.min_similarity or s1 - s2 < self.min_margin
         if unsure and _QUESTION.search(text) and self.memory_probe is not None and self.memory_probe(text):
             return Route("recall.query", "memory", scores)  # memory clearly has something on it: recall first
-        if s1 - s2 >= self.min_margin and (s1 >= self.min_similarity or i1 not in ("task.add", "reminder.set")):
+        if s1 - s2 >= self.min_margin and (
+            s1 >= self.min_similarity or i1 not in ("task.add", "reminder.set", "meta.history")
+        ):
             # A clear winner, even at modest similarity, beats asking a 1B model. Tasks and
             # reminders change state, so they also need a strong match (or a rule).
             return Route(i1, "centroid", scores)
@@ -128,9 +150,9 @@ class Router:
         # Close call. Narrow the choices before asking the small model:
         ranked = [i for i, _ in sorted(scores.items(), key=lambda kv: -kv[1])]
         # Things Kin changes (tasks, reminders) need explicit wording, never a guess.
-        allowed = set(ranked) - {"task.add", "reminder.set"}
+        allowed = set(ranked) - {"task.add", "reminder.set", "meta.history"}
         if _PERSONAL.search(text):
-            allowed -= {"fact.search", "fact.news"}  # personal questions never go online
+            allowed -= {"fact.search", "fact.news", "general.knowledge"}  # personal questions never go online
             if not _FACT_CUE["fact.weather"].search(text):
                 allowed -= {"fact.weather"}  # "when is my birthday" is memory, not a forecast
         candidates = [i for i in ranked if i in allowed][:3]

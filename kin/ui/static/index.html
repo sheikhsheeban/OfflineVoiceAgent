@@ -42,6 +42,10 @@
   .empty { color: var(--muted); font-style: italic; }
   .meter { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 6px 0 10px; }
   .meter div { height: 100%; width: 0; background: var(--teal); transition: width .15s; }
+  .meter.wake { position: relative; height: 12px; }
+  .meter.wake #wakebar { background: var(--muted); transition: width .08s; }
+  .meter.wake #wakebar.hit { background: var(--amber); }
+  .meter.wake #wakethr { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--ink); left: 50%; }
   dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 13px; }
   dt { color: var(--muted); } dd { margin: 0; font-variant-numeric: tabular-nums; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
@@ -69,6 +73,9 @@
                padding: 6px 12px; border-radius: 6px; cursor: pointer; }
   nav button[aria-selected="true"] { background: var(--teal-soft); color: var(--teal); }
   main[hidden] { display: none; }
+  /* In-flow strip under the header, not an overlay: it must never cover the page. */
+  #mutebar { display: flex; align-items: center; gap: 12px; padding: 6px 16px; background: #7a1f1f; color: #fff; font-size: 14px; }
+  #mutebar[hidden] { display: none; }
   .memwrap { max-width: 900px; margin: 0 auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 16px; }
   @media (max-width: 800px) { .memwrap { padding: 12px 16px; } header { flex-wrap: wrap; } }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -99,11 +106,17 @@
     <button role="tab" id="tab-live" aria-selected="true">Live</button>
     <button role="tab" id="tab-memory" aria-selected="false">Memory</button>
     <button role="tab" id="tab-tasks" aria-selected="false">Tasks</button>
+    <button role="tab" id="tab-egress" aria-selected="false">Egress</button>
   </nav>
   <span id="state" class="pill">connecting</span>
+  <span id="kstate" class="pill" title="what Kin is doing (the clip's LED shows the same)">listening</span>
+  <button class="btn small" id="muteBtn" title="Mute the microphone (a fallback: the clip's switch is the real mute)">Mute</button>
+  <label class="meta" title="Say answers aloud"><input type="checkbox" id="speakOn"> speak answers</label>
   <span class="spacer"></span>
   <span id="device" class="device"></span>
 </header>
+<div id="mutebar" hidden><span>🔇 Muted, nothing is being heard.</span>
+  <button class="btn small" id="unmuteBtn">Unmute</button></div>
 <main id="view-live">
   <section>
     <form id="askForm" class="ask">
@@ -118,6 +131,8 @@
       <h2>Listening</h2>
       <div class="meta">Input level</div>
       <div class="meter"><div id="level"></div></div>
+      <div class="meta">Wake score <span id="wkpeak"></span></div>
+      <div class="meter wake" title="the line marks the threshold"><div id="wakebar"></div><div id="wakethr"></div></div>
       <dl>
         <dt>Level / floor</dt><dd id="lvl">–</dd>
         <dt>Gate</dt><dd id="gate">–</dd>
@@ -125,6 +140,10 @@
         <dt>Wake score</dt><dd id="wk">–</dd>
         <dt>VAD duty</dt><dd id="duty">–</dd>
         <dt>Language model</dt><dd id="llm">not loaded</dd>
+        <dt>Voice reply</dt><dd id="voiceinfo">–</dd>
+        <dt>Your voice</dt><dd id="enrolinfo">–
+          <button class="btn small" id="enrolBtn">Enrol my voice</button></dd>
+        <dt>Network</dt><dd id="netinfo">–</dd>
       </dl>
     </section>
     <section>
@@ -161,6 +180,15 @@
       <div id="timeline"></div>
     </section>
   </div>
+</main>
+<main id="view-egress" hidden>
+  <section>
+    <h2>Egress ledger</h2>
+    <p class="meta" id="egressinfo">Every online call Kin makes, with the exact request. Nothing else leaves this laptop:
+      no audio, no transcripts, no memories, no questions.</p>
+    <table><thead><tr><th>Time</th><th>Host</th><th>Status</th><th>Out</th><th>In</th><th>Request</th></tr></thead>
+      <tbody id="ledgerRows"><tr><td colspan="6" class="empty">No online calls yet.</td></tr></tbody></table>
+  </section>
 </main>
 <main id="view-tasks" hidden>
   <div class="memwrap">
@@ -208,10 +236,13 @@ function answerHtml(m) {
   const why = [m.intent, m.route, m.gate].filter(Boolean).join(" · ") +
     (t.total_ms ? ` · ${Math.round(t.total_ms)} ms` : "") + (t.llm_ms ? ` (model ${Math.round(t.llm_ms)} ms)` : "") +
     (t.llm_load_ms ? ` + load ${Math.round(t.llm_load_ms)} ms` : "");
-  const fact = m.fact_request ? `<div class="why">would ask online (kin-gateway, week 4): <span class="fact">${esc(JSON.stringify(m.fact_request))}</span></div>` : "";
+  const f = m.fact;
+  const fact = m.fact_request ? `<div class="why">${f && f.host ? `asked ${esc(f.host)} (${esc(f.status)}, ${f.bytes_out} bytes out)` :
+    f && f.error ? `online lookup failed: ${esc(f.error)}` : "online lookup"}: <span class="fact">${esc(JSON.stringify(m.fact_request))}</span></div>` : "";
+  const spoken = m.spoken ? " · 🔊 spoken" : "";
   const note = m.offer_note ? ` <button class="btn small" data-note="${esc(m.question)}">Save as note</button>` : "";
   return `<div class="answer"><div class="say">${esc(m.text)}${note}</div>
-    <div class="why">${cites}${esc(why)}</div>${fact}</div>`;
+    <div class="why">${cites}${esc(why + spoken)}</div>${fact}</div>`;
 }
 
 function addTranscript(m) {
@@ -228,6 +259,8 @@ function addTranscript(m) {
     li.innerHTML = `<span class="meta">segment at ${m.start_s}s dropped (${esc(m.reason)})</span>`;
   } else {
     const tag = (m.wake ? `<span class="tag cmd">COMMAND</span>` : "") +
+                (m.wake_miss ? `<span class="tag" title="the wake word model missed it; the transcript started with the wake phrase">wake miss</span>` : "") +
+                (m.speaker && m.speaker !== "unknown" ? `<span class="tag">${esc(m.speaker)}</span>` : "") +
                 (m.episode_id ? `<span class="tag wake">#e-${m.episode_id}</span>` : "");
     const body = m.wake && m.command !== null ? (m.command || "(wake word only)") : m.text;
     li.innerHTML = `<div>${tag}${esc(body)}</div>
@@ -237,6 +270,7 @@ function addTranscript(m) {
   log.scrollTop = log.scrollHeight;
 }
 
+let wakeHold = 0;
 function onStatus(m) {
   const st = $("state");
   st.className = "pill " + (m.speech ? "speech" : "listening");
@@ -247,6 +281,15 @@ function onStatus(m) {
   $("gate").textContent = m.gate ? "open" : "closed";
   $("vad").textContent = m.vad;
   $("wk").textContent = m.wake_score ?? "off";
+  if (m.wake_score !== null && m.wake_score !== undefined) {
+    const thr = m.wake_threshold ?? 0.5;
+    // Hold the peak briefly so a 1 s wake word is readable; it decays back down.
+    wakeHold = Math.max(m.wake_score, wakeHold * 0.8);
+    $("wakebar").style.width = Math.round(wakeHold * 100) + "%";
+    $("wakebar").className = wakeHold >= thr ? "hit" : "";
+    $("wakethr").style.left = Math.round(thr * 100) + "%";
+    $("wkpeak").textContent = `${wakeHold.toFixed(2)} (threshold ${thr})` + (m.mode === "command" ? " · command window open" : "");
+  }
   $("duty").textContent = Math.round(m.vad_duty * 100) + "% of frames";
 }
 
@@ -271,12 +314,19 @@ function handle(m) {
     case "wake": lastWake = Date.now(); addTranscript(m); break;
     case "status": onStatus(m); break;
     case "stats": onStats(m); break;
-    case "audio_ready": micName = m.device; showDevice(); break;
-    case "core_info": asrName = m.asr; showDevice(); break;
+    case "audio_ready": micName = m.device + (m.clip ? " (Kin clip)" : ""); showDevice(); break;
+    case "core_info": asrName = m.asr; showDevice(); onCoreInfo(m); break;
     case "error": $("err").textContent = m.text; break;
     case "memory_changed": scheduleMemoryRefresh(); if (m.reason === "tasks") scheduleTasksRefresh(); break;
     case "answer": addTranscript(m); break;
     case "reminder": addTranscript(m); if (!replaying) showReminder(m); break;
+    case "kin_state": $("kstate").textContent = m.state; $("kstate").className = "pill " + (m.state === "listening" ? "listening" : m.state === "muted" ? "down" : "speech"); break;
+    case "mute": onMute(m); break;
+    case "voice": if (m.state === "speaking") $("kstate").title = "speaking"; break;
+    case "ledger": if (!replaying) scheduleLedgerRefresh(); break;
+    case "audio_fallback": micName = m.device; showDevice(); $("err").textContent = `The clip was unplugged, so Kin is using ${m.device}.`; break;
+    case "enrol": onEnrol(m); break;
+    case "consolidated": $("err").textContent = `Consolidated: ${m.digests} digest(s), ${m.merged} fact(s) merged, ${m.expired} episode(s) expired.`; break;
     case "llm_state": $("llm").textContent = m.loaded ? "loaded" : "not loaded (loads on first question)"; break;
     case "eos": $("state").textContent = "replay finished"; $("state").className = "pill"; break;
   }
@@ -301,13 +351,15 @@ const api = (path, opts) => {
 const memoryVisible = () => !$("view-memory").hidden;
 
 function showTab(name) {
-  for (const t of ["live", "memory", "tasks"]) {
+  for (const t of ["live", "memory", "tasks", "egress"]) {
     $("tab-" + t).setAttribute("aria-selected", String(t === name));
     $("view-" + t).hidden = t !== name;
   }
   if (name === "memory") refreshMemory();
   if (name === "tasks") refreshTasks();
+  if (name === "egress") refreshLedger();
 }
+$("tab-egress").onclick = () => showTab("egress");
 $("tab-tasks").onclick = () => showTab("tasks");
 $("tab-live").onclick = () => showTab("live");
 $("tab-memory").onclick = () => showTab("memory");
@@ -397,7 +449,7 @@ $("askForm").onsubmit = async (e) => {
   if (!q) return;
   $("askq").value = "";
   $("askq").placeholder = "Thinking…";
-  try { await api(`/api/ask?q=${encodeURIComponent(q)}`, { method: "POST" }); }  // the answer arrives over the WebSocket
+  try { await api(`/api/ask?q=${encodeURIComponent(q)}&speak=${$("speakOn").checked}`, { method: "POST" }); }  // the answer arrives over the WebSocket
   catch (err) { $("err").textContent = err.message; }
   finally { $("askq").placeholder = "Ask Kin anything about what you heard"; }
 };
@@ -481,6 +533,56 @@ $("noteForm").onsubmit = async (e) => {
   await api(`/api/notes?text=${encodeURIComponent(text)}`, { method: "POST" });
   await api(`/api/tasks`).then(refreshTasks);
 };
+
+// ---- mute, voice, voice enrolment, egress ledger ---------------------------------
+let muteSource = null;
+function onMute(m) {
+  muteSource = m.muted ? m.source : null;
+  $("mutebar").hidden = !m.muted;
+  $("muteBtn").textContent = m.muted ? "Unmute" : "Mute";
+  $("unmuteBtn").hidden = m.muted && m.source === "clip";  // the clip's switch is hardware: only the switch unmutes
+  $("mutebar").firstElementChild.textContent = m.source === "clip"
+    ? "🔇 Muted by the clip's switch. Nothing is being heard." : "🔇 Muted, nothing is being heard.";
+}
+$("muteBtn").onclick = () => api("/api/mute?muted=" + (muteSource ? "false" : "true"), { method: "POST" }).catch((e) => alert(e.message));
+$("unmuteBtn").onclick = () => api("/api/mute?muted=false", { method: "POST" }).catch((e) => alert(e.message));
+
+function onCoreInfo(m) {
+  const v = m.voice || {};
+  $("voiceinfo").textContent = v.available ? (v.enabled ? "on (Piper, local)" : "off") : "voice model missing";
+  $("speakOn").checked = !!v.enabled;
+  $("speakOn").disabled = !v.available;
+  const sp = m.speaker || {};
+  $("enrolinfo").firstChild.textContent = sp.installed ? (sp.enrolled ? "enrolled " : "not enrolled ") : "model missing ";
+  $("enrolBtn").hidden = !sp.installed;
+  $("netinfo").textContent = m.net ? (m.net.blocked ? "kin-core blocked (" + m.net.method + ")" : "NOT blocked!") : "–";
+}
+$("speakOn").onchange = () => api("/api/voice?enabled=" + $("speakOn").checked, { method: "POST" }).then(
+  (r) => { if (r.enabled) api("/api/voice/test", { method: "POST" }); }).catch((e) => alert(e.message));
+
+function onEnrol(m) {
+  $("enrolinfo").firstChild.textContent = m.done ? "enrolled " : `listening… ${m.seconds}/10 s `;
+  $("enrolBtn").textContent = m.done ? "Re-enrol" : "Cancel";
+}
+$("enrolBtn").onclick = () => {
+  const cancelling = $("enrolBtn").textContent === "Cancel";
+  api("/api/enrol/" + (cancelling ? "cancel" : "start"), { method: "POST" }).then(() => {
+    $("enrolBtn").textContent = cancelling ? "Enrol my voice" : "Cancel";
+    $("enrolinfo").firstChild.textContent = cancelling ? "not enrolled " : "speak for ~10 s… ";
+  }).catch((e) => alert(e.message));
+};
+
+let ledgerTimer;
+function scheduleLedgerRefresh() { clearTimeout(ledgerTimer); ledgerTimer = setTimeout(refreshLedger, 300); }
+async function refreshLedger() {
+  const r = await api("/api/ledger?limit=100");
+  $("egressinfo").textContent = `${r.count} online call${r.count === 1 ? "" : "s"} recorded. Every one is listed here with the exact request. ` +
+    "Nothing else leaves this laptop: no audio, no transcripts, no memories, no questions.";
+  $("ledgerRows").innerHTML = r.entries.length ? r.entries.map((e) =>
+    `<tr><td>${new Date(e.ts * 1000).toLocaleTimeString()}</td><td>${esc(e.host)}</td><td>${esc(e.status)}</td>` +
+    `<td>${e.bytes_out}</td><td>${e.bytes_in}</td><td><code>${esc(e.payload)}</code></td></tr>`).join("")
+    : `<tr><td colspan="6" class="empty">No online calls yet.</td></tr>`;
+}
 </script>
 </body>
 </html>
